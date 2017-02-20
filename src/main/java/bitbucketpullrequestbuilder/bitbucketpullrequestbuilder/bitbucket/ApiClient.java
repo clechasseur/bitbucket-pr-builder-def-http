@@ -6,15 +6,19 @@ import org.apache.commons.httpclient.methods.GetMethod;
 import org.apache.commons.httpclient.methods.PostMethod;
 import org.apache.commons.httpclient.methods.DeleteMethod;
 import org.apache.commons.httpclient.params.HttpClientParams;
+import org.apache.commons.io.IOUtils;
 import org.codehaus.jackson.map.ObjectMapper;
 import org.codehaus.jackson.map.type.TypeFactory;
 import org.codehaus.jackson.type.JavaType;
 import org.codehaus.jackson.type.TypeReference;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -35,7 +39,8 @@ public class ApiClient {
     private static final Logger logger = Logger.getLogger(ApiClient.class.getName());
     private static final String V1_API_BASE_URL = "https://bitbucket.org/api/1.0/repositories/";
     private static final String V2_API_BASE_URL = "https://bitbucket.org/api/2.0/repositories/";
-    private static final String COMPUTED_KEY_FORMAT = "%s-%s";    
+    private static final String COMPUTED_KEY_FORMAT = "%s-%s";
+    private static final int DEFAULT_TIMEOUT = 60000;
     private String owner;
     private String repositoryName;
     private Credentials credentials;
@@ -47,7 +52,6 @@ public class ApiClient {
 
     public static class HttpClientFactory {    
         public static final HttpClientFactory INSTANCE = new HttpClientFactory();
-        private static final int DEFAULT_TIMEOUT = 60000;
         
         public HttpClient getInstanceHttpClient() {
             HttpClient client = new HttpClient();
@@ -255,17 +259,53 @@ public class ApiClient {
         HttpClient client = getHttpClient();
         client.getState().setCredentials(AuthScope.ANY, credentials);
         client.getParams().setAuthenticationPreemptive(true);
+        req.setRequestHeader("Connection", "close");
+        String response = null;
+        FutureTask<String> httpTask = null;
+        Thread thread;
         try {
-            client.executeMethod(req);
-            return req.getResponseBodyAsString();
-        } catch (HttpException e) {
+            httpTask = new FutureTask<String>(new Callable<String>() {
+                private HttpClient client;
+                private HttpMethodBase req;
+
+                public String call() throws Exception {
+                    String response = null;
+                    try {
+                        client.executeMethod(req);
+                        InputStream responseBodyAsStream = req.getResponseBodyAsStream();
+                        StringWriter stringWriter = new StringWriter();
+                        IOUtils.copy(responseBodyAsStream, stringWriter, "UTF-8");
+                        response = stringWriter.toString();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                    return response;
+                }
+
+                public Callable<String> init(HttpClient client, HttpMethodBase req) {
+                    this.client = client;
+                    this.req = req;
+                    return this;
+                }
+            }.init(client, req));
+            thread = new Thread(httpTask);
+            thread.start();
+            response = httpTask.get((long) DEFAULT_TIMEOUT, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
             logger.log(Level.WARNING, "Failed to send request.", e);
-        } catch (IOException e) {
+            e.printStackTrace();
+        } catch (ExecutionException e) {
             logger.log(Level.WARNING, "Failed to send request.", e);
+            e.printStackTrace();
+        } catch (TimeoutException e) {
+            logger.log(Level.WARNING, "Failed to send request.", e);
+            e.printStackTrace();
+            req.abort();
+            httpTask.cancel(true);
         } finally {
-          req.releaseConnection();
+            req.releaseConnection();
         }
-        return null;
+        return response;
     }
 
     private <R> R parse(String response, Class<R> cls) throws IOException {
